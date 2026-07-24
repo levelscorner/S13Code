@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from s13code.core.live_graph import GraphPatch, GraphStore, LiveGraphExecutor, TaskSpec
+from s13code.core.live_graph import GraphPatch, GraphStore, LiveGraphExecutor, RunBudget, TaskSpec
 from s13code.core.memory import MemoryKind, MemoryRecord, MemoryScope, MemoryStore, Principal, SourceRef
 from s13code.core.memory.embeddings import OllamaNomicEmbedder
 from s13code.planner import ConstrainedGraphPatchPlanner
@@ -90,7 +90,10 @@ class S13Runtime:
         self.root = root or Path(os.getenv("S13_DATA_DIR", str(Path.home() / ".s13code")))
         self.root.mkdir(parents=True, exist_ok=True)
         self.memory = MemoryStore(self.root / "memory.sqlite", embedder=OllamaNomicEmbedder())
-        self.graph = GraphStore(self.root / "graph.sqlite")
+        # Per-run work cap (invariant 8). Unset means unlimited, as before.
+        launches = os.getenv("S13_MAX_TASK_LAUNCHES")
+        budget = RunBudget(max_task_launches=int(launches)) if launches else None
+        self.graph = GraphStore(self.root / "graph.sqlite", budget=budget)
 
     def close(self) -> None:
         self.memory.close()
