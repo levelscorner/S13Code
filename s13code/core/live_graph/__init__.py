@@ -8,9 +8,10 @@ from .core import (
     NodeState,
     TaskSpec,
 )
+from .budget import RunBudget
 from .store import GraphStore
 
 __all__ = [
     "Event", "GraphPatch", "GraphSnapshot", "GraphStore",
-    "LiveGraphExecutor", "NodeState", "TaskSpec",
+    "LiveGraphExecutor", "NodeState", "RunBudget", "TaskSpec",
 ]

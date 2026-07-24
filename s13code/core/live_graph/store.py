@@ -7,6 +7,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from .budget import RunBudget
 from .core import Event, GraphPatch, GraphSnapshot, NodeState, TaskSpec
 
 
@@ -17,8 +18,11 @@ class GraphMutationError(ValueError):
 class GraphStore:
     """Durable graph storage. A patch and its journal entry commit together."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, budget: RunBudget | None = None):
         self.path = str(path)
+        # Per-run work budget (invariant 8). Unlimited unless configured, so an
+        # existing deployment behaves exactly as before.
+        self.budget = budget or RunBudget()
         # FastAPI's test/client boundary (and a local server's worker thread)
         # may resume a durable run from a different thread than construction.
         # Graph mutations remain transaction-scoped; callers do not share a
@@ -97,7 +101,28 @@ class GraphStore:
             "SELECT parent_id, child_id FROM edges WHERE run_id=? ORDER BY parent_id, child_id", (run_id,)))
         return GraphSnapshot(run_id, bool(run["finished"]), nodes, edges)
 
+    def _budget_state(self, run_id: str) -> tuple[int, bool]:
+        """(tasks launched so far, whether budget exhaustion was journalled)."""
+        launches = self.db.execute(
+            "SELECT COUNT(*) AS n FROM events WHERE run_id=? AND kind='task_started'", (run_id,)
+        ).fetchone()["n"]
+        marked = self.db.execute(
+            "SELECT 1 FROM events WHERE run_id=? AND kind='budget_exhausted' LIMIT 1", (run_id,)
+        ).fetchone() is not None
+        return int(launches), marked
+
     def ready(self, run_id: str, *, limit: int) -> list[TaskSpec]:
+        # Budget-aware branch: while the work budget is live, never hand out more
+        # launches than it permits — the cap is enforced before any work starts,
+        # not after it has been paid for. Once exhaustion has been journalled the
+        # backlog is already cancelled, so the cap stops gating and the planner's
+        # finalisation step (the answer) is free to run.
+        if self.budget.enabled:
+            launches, exhausted_marked = self._budget_state(run_id)
+            if not exhausted_marked:
+                limit = min(limit, self.budget.remaining(launches) or 0)
+                if limit <= 0:
+                    return []
         # A task becomes ready only when every parent has actually succeeded.
         rows = self.db.execute("""
           SELECT n.* FROM nodes n WHERE n.run_id=? AND n.state=?
@@ -122,7 +147,41 @@ class GraphStore:
                                   (state, json.dumps(payload), run_id, node_id, NodeState.RUNNING))
             if row.rowcount != 1:
                 raise GraphMutationError(f"cannot record outcome for {node_id}: it is not running")
-            return self._event(run_id, "task_succeeded" if success else "task_failed", node_id, payload)
+            event = self._event(run_id, "task_succeeded" if success else "task_failed", node_id, payload)
+            self._enforce_budget(run_id)
+            return event
+
+    def _enforce_budget(self, run_id: str) -> None:
+        """Take the budget-aware branch once the work cap is reached.
+
+        Cancels the whole remaining backlog — pending, waiting *and* still
+        running — and journals ``budget_exhausted``. It runs inside
+        ``record_outcome``'s transaction, so the cancellations commit atomically
+        with the outcome that tripped the cap and, crucially, *before* the
+        executor consults the planner: the planner then sees an all-terminal
+        graph and finalises an answer from the evidence already gathered instead
+        of expanding a frontier the run can no longer pay for. A cancelled
+        in-flight task's late result is discarded by the executor, so work the
+        budget refused can never leak into the answer.
+        """
+        if not self.budget.enabled:
+            return
+        launches, marked = self._budget_state(run_id)
+        if marked or not self.budget.exhausted(launches):
+            return
+        backlog = self.db.execute(
+            "SELECT id, state FROM nodes WHERE run_id=? AND state IN (?, ?, ?) ORDER BY id",
+            (run_id, NodeState.PENDING, NodeState.WAITING, NodeState.RUNNING),
+        ).fetchall()
+        for node in backlog:
+            self.db.execute("UPDATE nodes SET state=? WHERE run_id=? AND id=?",
+                            (NodeState.CANCELLED, run_id, node["id"]))
+            self._event(run_id, "task_cancelled", node["id"],
+                        {"reason": "work budget exhausted", "budget_cancelled": True,
+                         "was_running": node["state"] == NodeState.RUNNING})
+        self._event(run_id, "budget_exhausted", None,
+                    {"launches": launches, "max_task_launches": self.budget.max_task_launches,
+                     "cancelled": [node["id"] for node in backlog]})
 
     def pending_planner_events(self, run_id: str) -> list[Event]:
         """Events whose graph mutation was not committed yet."""
